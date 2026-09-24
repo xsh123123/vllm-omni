@@ -8,7 +8,7 @@ from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, conditioning_cache_salt
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import parse_ming_instruction_fields
 
 if TYPE_CHECKING:
@@ -94,6 +94,12 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
             info["spk_emb"] = list(request.speaker_embedding)
         prompt = tokens_input(prompt_token_ids=[0])
         prompt["additional_information"] = info
+        # Every request shares the same single placeholder token; text, caption
+        # instruction, voice and speaker embedding all ride in
+        # ``additional_information``, invisible to vLLM's prefix-cache hash.
+        # Without a salt, enabling prefix caching would let any two requests
+        # (even different texts) reuse each other's KV.
+        prompt["cache_salt"] = conditioning_cache_salt(request, {})
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="ming_flash_omni_tts")
 
     def _load_supported_speakers(self) -> set[str]:

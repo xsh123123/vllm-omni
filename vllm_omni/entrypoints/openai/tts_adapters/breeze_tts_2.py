@@ -19,6 +19,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.base import (
     PreparedRequest,
     SpeechServingContext,
     apply_max_new_tokens,
+    conditioning_cache_salt,
 )
 from vllm_omni.model_executor.models.breeze_tts_2.prompt import DEFAULT_INSTRUCTION, build_breeze_prompt
 
@@ -152,12 +153,21 @@ class BreezeTTS2Adapter(ARTTSAdapter):
         has_inline_ref_audio: bool,
     ) -> PreparedRequest:
         reference = None
+        tts_params: dict = {}
         if request.ref_audio is not None:
             audio = request.ref_audio[0] if isinstance(request.ref_audio, list) else request.ref_audio
-            waveform, sample_rate, _ = await self.ctx.server._resolve_ref_audio(audio)
+            waveform, sample_rate, cache_key = await self.ctx.server._resolve_ref_audio(audio)
             reference = (np.asarray(waveform, dtype=np.float32), sample_rate)
+            if cache_key is not None:
+                tts_params["ref_audio_cache_key"] = cache_key
         prompt = await self._build_async(request, sampling_params_list[0], reference)
-        return PreparedRequest(prompt=prompt, model_type=self.name)
+        # Breeze's prefill tokens are placeholders; text, instruction and the
+        # reference waveform ride in ``additional_information``, invisible to
+        # vLLM's prefix-cache hash. Salt the prompt with the request
+        # conditioning (plus the content-aware resolve key) so clones of the
+        # same text with different voices cannot share a cache entry.
+        prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
+        return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type=self.name)
 
     def apply_sampling_overrides(
         self,

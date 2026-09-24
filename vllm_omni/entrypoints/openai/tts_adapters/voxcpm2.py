@@ -10,7 +10,12 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    ARTTSAdapter,
+    PreparedRequest,
+    apply_max_new_tokens,
+    conditioning_cache_salt,
+)
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
 from vllm_omni.utils.speaker_cache import validate_voxcpm2_profile
 
@@ -56,11 +61,15 @@ class VoxCPM2Adapter(ARTTSAdapter):
         self,
         request: "OpenAICreateSpeechRequest",
         uploaded_ref: tuple[np.ndarray, int] | None = None,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], str | None]:
         """Build the full-length VoxCPM2 prefill prompt.
 
         ``uploaded_ref`` supplies an uploaded voice waveform when the request
         has no explicit ``ref_audio`` so prefill-length accounting includes it.
+
+        Returns the prompt and the resolve-cache key of an inline ``ref_audio``
+        (``None`` otherwise); the caller folds the key into the prefix-cache
+        salt so a same-path local rewrite re-keys the conditioning.
         """
         from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import build_voxcpm2_prompt
 
@@ -69,14 +78,15 @@ class VoxCPM2Adapter(ARTTSAdapter):
         ref_audio = None
         ref_sr = None
         voice_profile = None
+        ref_cache_key = None
         if request.ref_audio is not None:
-            ref_audio, ref_sr, _ = await server._resolve_ref_audio(request.ref_audio)
+            ref_audio, ref_sr, ref_cache_key = await server._resolve_ref_audio(request.ref_audio)
         elif uploaded_ref is not None:
             wav_np, ref_sr = uploaded_ref
             ref_audio = wav_np.tolist()
         elif request.voice is not None:
             voice_profile = self.capabilities.precomputed_speakers.get(request.voice.lower())
-        return build_voxcpm2_prompt(
+        prompt = build_voxcpm2_prompt(
             hf_config=self.ctx.engine_client.model_config.hf_config,
             tokenizer=self._tokenizer,
             split_map=self._split_map,
@@ -86,6 +96,7 @@ class VoxCPM2Adapter(ARTTSAdapter):
             ref_text=request.ref_text,
             voice_profile=voice_profile,
         )
+        return prompt, ref_cache_key
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate VoxCPM2 request parameters. Returns error message or None."""
@@ -125,14 +136,22 @@ class VoxCPM2Adapter(ARTTSAdapter):
                     )
                 if request.ref_audio is None:
                     uploaded_ref = server._load_uploaded_audio(voice_lower)
-        prompt = await self._build_prompt(request, uploaded_ref=uploaded_ref)
+        prompt, ref_cache_key = await self._build_prompt(request, uploaded_ref=uploaded_ref)
         tts_params = {}
+        if ref_cache_key is not None:
+            tts_params["ref_audio_cache_key"] = ref_cache_key
         if request.voice:
             voice_lower = request.voice.lower()
             if voice_lower in server.uploaded_speakers or voice_lower in self.capabilities.precomputed_speakers:
                 additional = prompt.setdefault("additional_information", {})
                 additional["voice_name"] = voice_lower
                 additional["voice_created_at"] = server._voice_created_at(voice_lower)
+                tts_params["voice_created_at"] = additional["voice_created_at"]
+        # The prefill prompt is placeholder tokens; the real voice conditioning
+        # travels in ``additional_information``, which vLLM's prefix-cache hash
+        # never sees. Fold it into ``cache_salt`` so same-text requests with
+        # different reference audio (or a re-uploaded voice) cannot collide.
+        prompt["cache_salt"] = conditioning_cache_salt(request, tts_params)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="voxcpm2")
 
     async def warmup(self) -> None:

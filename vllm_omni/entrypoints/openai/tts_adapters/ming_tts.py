@@ -10,7 +10,7 @@ from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, conditioning_cache_salt
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import DEFAULT_PROMPT as MING_DEFAULT_PROMPT
 from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 
@@ -198,10 +198,11 @@ class MingTTSAdapter(ARTTSAdapter):
                 uploaded_audio_voice = voice_lower
                 uploaded_audio_created_at = server._voice_created_at(voice_lower)
         ref_audio_data = None
+        ref_cache_key = None
         if isinstance(ref_audio_source, list):
             ref_audio_data = await server._resolve_ref_audio_many(ref_audio_source)
         elif ref_audio_source is not None and isinstance(ref_audio_source, str):
-            wav_list, sr, _ = await server._resolve_ref_audio(ref_audio_source)
+            wav_list, sr, ref_cache_key = await server._resolve_ref_audio(ref_audio_source)
             ref_audio_data = (wav_list, sr)
         prompt = self._build_ming_dense_prompt(
             request,
@@ -210,6 +211,16 @@ class MingTTSAdapter(ARTTSAdapter):
             voice_created_at=uploaded_audio_created_at,
         )
         tts_params = prompt.get("additional_information", {})
+        # The resolved voice conditioning (reference waveform, and
+        # ``voice_created_at`` for uploaded speakers) rides in
+        # ``additional_information``, which vLLM's prefix-cache hash never
+        # sees; ``tts_params`` already exposes the foldable keys to the salt.
+        # Add the content-aware resolve key for the inline-ref path without
+        # leaking it into the model-side ``additional_information`` dict, so a
+        # same-path local rewrite (or a different voice with the same text)
+        # cannot reuse another request's cached KV.
+        salt_params = tts_params if ref_cache_key is None else {**tts_params, "ref_audio_cache_key": ref_cache_key}
+        prompt["cache_salt"] = conditioning_cache_salt(request, salt_params)
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="ming_tts")
 
     def apply_sampling_overrides(
